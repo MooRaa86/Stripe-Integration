@@ -1,8 +1,12 @@
 package com.Stripe.controller;
 
+import com.Stripe.dto.CheckoutResponse;
+import com.Stripe.dto.CreateCheckoutRequest;
 import com.Stripe.service.PaymentService;
 import com.stripe.exception.StripeException;
+import jakarta.validation.Valid;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -17,8 +21,15 @@ public class PaymentController {
     }
 
     @PostMapping("/checkout")
-    public String createCheckoutSession() throws StripeException {
+    public CheckoutResponse createCheckout(
+            @Valid @RequestBody CreateCheckoutRequest request
+    ) throws StripeException {
 
-        return paymentService.createCheckoutSession();
+        String checkoutUrl =
+                paymentService.createCheckoutSession(
+                        request.orderId()
+                );
+
+        return new CheckoutResponse(checkoutUrl);
     }
 }

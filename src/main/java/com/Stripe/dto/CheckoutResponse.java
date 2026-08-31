@@ -1,4 +1,6 @@
 package com.Stripe.dto;
 
-public class CheckoutResponse {
+public record CheckoutResponse(
+        String checkoutUrl
+) {
 }
