@@ -5,11 +5,13 @@ import com.Stripe.entity.Order;
 import com.Stripe.entity.OrderStatus;
 import com.Stripe.repository.OrderRepository;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.UUID;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class OrderService {
@@ -25,6 +27,11 @@ public class OrderService {
                 .status(OrderStatus.PENDING)
                 .build();
 
-        return orderRepository.save(order);
+        orderRepository.save(order);
+
+        log.info("Order {} created for {} {}",
+                order.getId(), order.getAmount(), order.getCurrency());
+
+        return order;
     }
 }

@@ -1,14 +1,25 @@
 package com.Stripe.service;
 
-import com.Stripe.entity.*;
+import com.Stripe.entity.Order;
+import com.Stripe.entity.OrderStatus;
+import com.Stripe.entity.Payment;
+import com.Stripe.entity.PaymentStatus;
+import com.Stripe.entity.Refund;
+import com.Stripe.entity.StripeEvent;
+import com.Stripe.exception.OrderNotFoundException;
+import com.Stripe.exception.PaymentNotFoundException;
 import com.Stripe.repository.OrderRepository;
 import com.Stripe.repository.PaymentRepository;
 import com.Stripe.repository.RefundRepository;
 import com.Stripe.repository.StripeEventRepository;
+import com.Stripe.util.StripeAmountConverter;
 import com.stripe.exception.StripeException;
 import com.stripe.model.Charge;
 import com.stripe.model.Event;
+import com.stripe.model.RefundCollection;
+import com.stripe.param.RefundListParams;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -16,11 +27,17 @@ import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.UUID;
 
+/**
+ * Processes Stripe webhook events. Stripe does not guarantee event ordering,
+ * so each handler must be able to run independently and be safe to retry.
+ * <p>
+ * Webhook retries: if processing throws, no event is marked processed and the
+ * endpoint returns an error, prompting Stripe to retry the delivery.
+ */
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class StripeWebhookService {
-
-    //stripe listen --forward-to localhost:8080/api/webhooks/stripe
 
     private final OrderRepository orderRepository;
     private final PaymentRepository paymentRepository;
@@ -35,111 +52,63 @@ public class StripeWebhookService {
                         .findByStripeEventId(event.getId())
                         .orElse(null);
 
-        // Event was successfully processed before
+        /*
+         * The same Stripe event can be delivered more than once (retries or
+         * duplicate delivery). Only process events that have not already been
+         * handled successfully.
+         */
         if (stripeEvent != null && stripeEvent.isProcessed()) {
-
-            System.out.println(
-                    "Event already processed: "
-                            + event.getId()
-            );
-
+            log.info("Skipping already processed event {}", event.getId());
             return;
         }
 
-        // Event exists but previous processing failed
         if (stripeEvent == null) {
-
+            /*
+             * Persist the event before processing so that a concurrent retry
+             * can see that delivery has begun. The whole transaction rolls
+             * back if processing fails, so the event is left unprocessed.
+             */
             stripeEvent = StripeEvent.builder()
                     .stripeEventId(event.getId())
                     .eventType(event.getType())
                     .processed(false)
                     .createdAt(Instant.now())
                     .build();
-
             stripeEventRepository.save(stripeEvent);
         }
 
         switch (event.getType()) {
-
-            case "checkout.session.completed":
-                handleCheckoutSessionCompleted(event);
-                break;
-
-            case "payment_intent.succeeded":
-                handlePaymentIntentSucceeded(event);
-                break;
-
-            case "payment_intent.payment_failed":
-                handlePaymentIntentFailed(event);
-                break;
-
-            case "charge.refunded":
-                handleChargeRefunded(event);
-                break;
-
-            default:
-                System.out.println(
-                        "Unhandled event: " + event.getType()
-                );
+            case "checkout.session.completed" -> handleCheckoutSessionCompleted(event);
+            case "payment_intent.succeeded" -> handlePaymentIntentSucceeded(event);
+            case "payment_intent.payment_failed" -> handlePaymentIntentFailed(event);
+            case "charge.refunded" -> handleChargeRefunded(event);
+            default -> log.info("Ignoring unhandled event type {}", event.getType());
         }
 
         stripeEvent.setProcessed(true);
         stripeEventRepository.save(stripeEvent);
     }
 
-    private void handleCheckoutSessionCompleted(
-            Event event
-    ) {
-
-        var optionalSession =
-                event.getDataObjectDeserializer()
-                        .getObject();
-
-        if (optionalSession.isEmpty()) {
-            throw new IllegalStateException(
-                    "Could not deserialize Checkout Session"
-            );
-        }
+    /**
+     * Stores the Stripe resource identifiers on the local payment.
+     * <p>
+     * This handler intentionally updates only the identifier columns through a
+     * targeted database query. If it saved the entire entity instead, a stale
+     * copy of the Payment (for example one still holding PENDING) could
+     * overwrite a newer status written by a concurrent webhook.
+     */
+    private void handleCheckoutSessionCompleted(Event event) {
 
         var session =
-                (com.stripe.model.checkout.Session)
-                        optionalSession.get();
+                deserialize(event,
+                        com.stripe.model.checkout.Session.class,
+                        "Checkout Session");
 
-        String orderIdValue =
-                session.getMetadata().get("orderId");
+        String orderIdValue = getOrderIdFromMetadata(
+                session.getMetadata());
 
-        if (orderIdValue == null) {
-            throw new IllegalStateException(
-                    "orderId is missing from Stripe metadata"
-            );
-        }
-
-        UUID orderId;
-
-        try {
-            orderId = UUID.fromString(orderIdValue);
-        } catch (IllegalArgumentException e) {
-            throw new IllegalStateException(
-                    "Invalid orderId in Stripe metadata",
-                    e
-            );
-        }
-
-        Order order = orderRepository.findById(orderId)
-                .orElseThrow(() ->
-                        new IllegalStateException(
-                                "Order not found: " + orderId
-                        )
-                );
-
-        Payment payment =
-                paymentRepository.findByOrder(order)
-                        .orElseThrow(() ->
-                                new IllegalStateException(
-                                        "Payment not found for order: "
-                                                + orderId
-                                )
-                        );
+        Order order = findOrder(orderIdValue);
+        Payment payment = findPaymentForOrder(order);
 
         paymentRepository.updateStripeIds(
                 payment.getId(),
@@ -147,269 +116,180 @@ public class StripeWebhookService {
                 session.getPaymentIntent()
         );
 
-        System.out.println(
-                "Checkout session processed for order: "
-                        + orderId
-        );
+        log.info("Checkout session stored for order {}", order.getId());
     }
 
+    /**
+     * Marks the payment and order as successful once Stripe confirms the
+     * PaymentIntent succeeded.
+     * <p>
+     * orderId is stored in the PaymentIntent metadata so this handler does not
+     * depend on checkout.session.completed having been processed first
+     * (Stripe does not guarantee delivery order).
+     */
     private void handlePaymentIntentSucceeded(Event event) {
 
-        var optionalPaymentIntent =
-                event.getDataObjectDeserializer()
-                        .getObject();
-
-        if (optionalPaymentIntent.isEmpty()) {
-            throw new IllegalStateException(
-                    "Could not deserialize PaymentIntent"
-            );
-        }
-
         var paymentIntent =
-                (com.stripe.model.PaymentIntent)
-                        optionalPaymentIntent.get();
+                deserialize(event, com.stripe.model.PaymentIntent.class,
+                        "PaymentIntent");
 
-        String paymentIntentId =
-                paymentIntent.getId();
+        String orderIdValue = getOrderIdFromMetadata(
+                paymentIntent.getMetadata());
 
-        String orderIdValue =
-                paymentIntent.getMetadata().get("orderId");
+        Order order = findOrder(orderIdValue);
+        Payment payment = findPaymentForOrder(order);
 
-        if (orderIdValue == null) {
-            throw new IllegalStateException(
-                    "orderId is missing from PaymentIntent metadata"
-            );
-        }
-
-        UUID orderId = UUID.fromString(orderIdValue);
-
-        Order order = orderRepository.findById(orderId)
-                .orElseThrow(() ->
-                        new IllegalStateException(
-                                "Order not found: " + orderId
-                        )
-                );
-
-        Payment payment =
-                paymentRepository.findByOrder(order)
-                        .orElseThrow(() ->
-                                new IllegalStateException(
-                                        "Payment not found for order: "
-                                                + orderId
-                                )
-                        );
-
-        payment.setStripePaymentIntentId(
-                paymentIntentId
-        );
-
-        payment.setStatus(
-                PaymentStatus.SUCCEEDED
-        );
-
-        order.setStatus(
-                OrderStatus.PAID
-        );
+        payment.setStripePaymentIntentId(paymentIntent.getId());
+        payment.setStatus(PaymentStatus.SUCCEEDED);
+        order.setStatus(OrderStatus.PAID);
 
         paymentRepository.saveAndFlush(payment);
         orderRepository.saveAndFlush(order);
 
-        System.out.println(
-                "Payment succeeded for order: "
-                        + orderId
-        );
-
+        log.info("Payment succeeded for order {}", order.getId());
     }
 
+    /**
+     * Marks the payment and order as failed once Stripe reports the
+     * PaymentIntent could not be completed.
+     */
     private void handlePaymentIntentFailed(Event event) {
 
-        var optionalPaymentIntent =
-                event.getDataObjectDeserializer()
-                        .getObject();
-
-        if (optionalPaymentIntent.isEmpty()) {
-            throw new IllegalStateException(
-                    "Could not deserialize PaymentIntent"
-            );
-        }
-
         var paymentIntent =
-                (com.stripe.model.PaymentIntent)
-                        optionalPaymentIntent.get();
+                deserialize(event, com.stripe.model.PaymentIntent.class,
+                        "PaymentIntent");
 
-        String paymentIntentId =
-                paymentIntent.getId();
+        String orderIdValue = getOrderIdFromMetadata(
+                paymentIntent.getMetadata());
 
-        String orderIdValue =
-                paymentIntent.getMetadata().get("orderId");
+        Order order = findOrder(orderIdValue);
+        Payment payment = findPaymentForOrder(order);
 
-        if (orderIdValue == null) {
-            throw new IllegalStateException(
-                    "orderId is missing from PaymentIntent metadata"
-            );
-        }
-
-        UUID orderId = UUID.fromString(orderIdValue);
-
-        Order order = orderRepository.findById(orderId)
-                .orElseThrow(() ->
-                        new IllegalStateException(
-                                "Order not found: " + orderId
-                        )
-                );
-
-        Payment payment =
-                paymentRepository.findByOrder(order)
-                        .orElseThrow(() ->
-                                new IllegalStateException(
-                                        "Payment not found for order: "
-                                                + orderId
-                                )
-                        );
-
-        payment.setStripePaymentIntentId(
-                paymentIntentId
-        );
-
-        payment.setStatus(
-                PaymentStatus.FAILED
-        );
-
-        order.setStatus(
-                OrderStatus.FAILED
-        );
+        payment.setStripePaymentIntentId(paymentIntent.getId());
+        payment.setStatus(PaymentStatus.FAILED);
+        order.setStatus(OrderStatus.FAILED);
 
         paymentRepository.save(payment);
         orderRepository.save(order);
 
-        System.out.println(
-                "Payment failed for order: "
-                        + orderId
-        );
+        log.info("Payment failed for order {}", order.getId());
     }
 
+    /**
+     * Reconciles refunds created in Stripe with local Refund records and
+     * updates the payment status to REFUNDED or PARTIALLY_REFUNDED.
+     * <p>
+     * The Charge event object does not contain the refunds as an expanded
+     * collection, so the refunds are fetched from the Stripe API by charge id.
+     * Processing is idempotent: a Stripe Refund is stored locally only once,
+     * keyed by its unique Stripe refund id.
+     */
     private void handleChargeRefunded(Event event) throws StripeException {
 
-        var optionalCharge =
-                event.getDataObjectDeserializer()
-                        .getObject();
-
-        if (optionalCharge.isEmpty()) {
-            throw new IllegalStateException(
-                    "Could not deserialize Charge"
-            );
-        }
-
         var charge =
-                (com.stripe.model.Charge)
-                        optionalCharge.get();
+                deserialize(event, com.stripe.model.Charge.class,
+                        "Charge");
 
-        String paymentIntentId =
-                charge.getPaymentIntent();
-
+        String paymentIntentId = charge.getPaymentIntent();
         if (paymentIntentId == null) {
             throw new IllegalStateException(
-                    "PaymentIntent is missing from Charge"
-            );
+                    "PaymentIntent is missing from Charge event");
         }
 
         Payment payment =
                 paymentRepository
-                        .findByStripePaymentIntentId(
-                                paymentIntentId
-                        )
+                        .findByStripePaymentIntentId(paymentIntentId)
                         .orElseThrow(() ->
-                                new IllegalStateException(
+                                new PaymentNotFoundException(
                                         "Payment not found for PaymentIntent: "
-                                                + paymentIntentId
-                                )
-                        );
+                                                + paymentIntentId));
 
-        // Get refunds directly from Stripe
-        com.stripe.model.RefundCollection refundCollection =
-                com.stripe.model.Refund.list(
-                        com.stripe.param.RefundListParams.builder()
-                                .setCharge(charge.getId())
-                                .build()
-                );
+        RefundCollection refundCollection =
+                com.stripe.model.Refund.list(RefundListParams.builder()
+                        .setCharge(charge.getId())
+                        .build());
 
         for (com.stripe.model.Refund stripeRefund
                 : refundCollection.getData()) {
 
-            String stripeRefundId =
-                    stripeRefund.getId();
-
-            // Idempotency check
             if (refundRepository
-                    .findByStripeRefundId(stripeRefundId)
+                    .findByStripeRefundId(stripeRefund.getId())
                     .isPresent()) {
-
-                System.out.println(
-                        "Refund already processed: "
-                                + stripeRefundId
-                );
-
+                log.info("Refund already processed {}",
+                        stripeRefund.getId());
                 continue;
             }
 
-            Refund refund =
-                    Refund.builder()
-                            .payment(payment)
-                            .amount(
-                                    BigDecimal
-                                            .valueOf(
-                                                    stripeRefund.getAmount()
-                                            )
-                                            .movePointLeft(2)
-                            )
-                            .currency(
-                                    stripeRefund.getCurrency()
-                            )
-                            .stripeRefundId(
-                                    stripeRefundId
-                            )
-                            .createdAt(Instant.now())
-                            .build();
+            Refund refund = Refund.builder()
+                    .payment(payment)
+                    .amount(StripeAmountConverter.fromSmallestUnits(
+                            stripeRefund.getAmount()))
+                    .currency(stripeRefund.getCurrency())
+                    .stripeRefundId(stripeRefund.getId())
+                    .createdAt(Instant.now())
+                    .build();
 
             refundRepository.save(refund);
-
-            System.out.println(
-                    "Refund saved: "
-                            + stripeRefundId
-            );
+            log.info("Refund saved {}", stripeRefund.getId());
         }
 
-        // Calculate total refunded
         BigDecimal totalRefunded =
                 refundRepository.getTotalRefunded(payment);
 
-        System.out.println(
-                "Total refunded: "
-                        + totalRefunded
-        );
-
-        // Update payment status
-        if (totalRefunded.compareTo(
-                payment.getAmount()
-        ) >= 0) {
-
-            payment.setStatus(
-                    PaymentStatus.REFUNDED
-            );
-
+        /*
+         * A refund request alone does not change the local status. The status
+         * is updated only after Stripe confirms the refund through the
+         * charge.refunded webhook.
+         */
+        if (totalRefunded.compareTo(payment.getAmount()) >= 0) {
+            payment.setStatus(PaymentStatus.REFUNDED);
         } else {
-
-            payment.setStatus(
-                    PaymentStatus.PARTIALLY_REFUNDED
-            );
+            payment.setStatus(PaymentStatus.PARTIALLY_REFUNDED);
         }
 
         paymentRepository.save(payment);
 
-        System.out.println(
-                "Payment refund status: "
-                        + payment.getStatus()
-        );
+        log.info("Payment {} refund status is now {}",
+                payment.getId(), payment.getStatus());
     }
 
+    private <T> T deserialize(Event event, Class<T> type, String label) {
+        var optional =
+                event.getDataObjectDeserializer().getObject();
+        if (optional.isEmpty() || !type.isInstance(optional.get())) {
+            throw new IllegalStateException(
+                    "Could not deserialize " + label + " from event");
+        }
+        return type.cast(optional.get());
+    }
+
+    private String getOrderIdFromMetadata(
+            java.util.Map<String, String> metadata
+    ) {
+        String orderIdValue = metadata.get("orderId");
+        if (orderIdValue == null) {
+            throw new IllegalStateException(
+                    "orderId is missing from Stripe metadata");
+        }
+        return orderIdValue;
+    }
+
+    private Order findOrder(String orderIdValue) {
+        UUID orderId;
+        try {
+            orderId = UUID.fromString(orderIdValue);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalStateException(
+                    "Invalid orderId in Stripe metadata: " + orderIdValue, e);
+        }
+        return orderRepository.findById(orderId)
+                .orElseThrow(() -> new OrderNotFoundException(orderId));
+    }
+
+    private Payment findPaymentForOrder(Order order) {
+        return paymentRepository.findByOrder(order)
+                .orElseThrow(() ->
+                        new PaymentNotFoundException(
+                                "Payment not found for order: " + order.getId()));
+    }
 }

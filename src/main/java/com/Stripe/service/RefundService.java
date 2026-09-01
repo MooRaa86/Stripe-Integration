@@ -2,19 +2,28 @@ package com.Stripe.service;
 
 import com.Stripe.entity.Payment;
 import com.Stripe.entity.PaymentStatus;
+import com.Stripe.exception.PaymentNotFoundException;
 import com.Stripe.repository.PaymentRepository;
 import com.Stripe.repository.RefundRepository;
+import com.Stripe.util.StripeAmountConverter;
 import com.stripe.exception.StripeException;
 import com.stripe.model.PaymentIntent;
 import com.stripe.model.Refund;
 import com.stripe.param.RefundCreateParams;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.util.UUID;
 
+/**
+ * Creates Stripe refunds on behalf of an API request. The Stripe Refund is the
+ * source of truth; the local Payment status is only updated after Stripe
+ * confirms the refund through the charge.refunded webhook.
+ */
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class RefundService {
@@ -31,70 +40,55 @@ public class RefundService {
         Payment payment =
                 paymentRepository.findById(paymentId)
                         .orElseThrow(() ->
-                                new RuntimeException(
-                                        "Payment not found"
-                                )
-                        );
+                                new PaymentNotFoundException(paymentId));
 
-        // Payment must be refundable
+        /*
+         * A payment can only be refunded once it has been successfully
+         * captured, or when it already holds a partial refund.
+         */
         if (payment.getStatus() != PaymentStatus.SUCCEEDED
-                && payment.getStatus()
-                != PaymentStatus.PARTIALLY_REFUNDED) {
-
+                && payment.getStatus() != PaymentStatus.PARTIALLY_REFUNDED) {
             throw new IllegalStateException(
-                    "Payment cannot be refunded"
-            );
+                    "Payment in state " + payment.getStatus()
+                            + " cannot be refunded");
         }
 
-        // Refund amount must be positive
         if (amount.compareTo(BigDecimal.ZERO) <= 0) {
             throw new IllegalArgumentException(
-                    "Refund amount must be greater than zero"
-            );
+                    "Refund amount must be greater than zero");
         }
 
-        // Calculate already refunded amount
         BigDecimal totalRefunded =
                 refundRepository.getTotalRefunded(payment);
 
-        // Calculate remaining amount
         BigDecimal remainingAmount =
-                payment.getAmount()
-                        .subtract(totalRefunded);
+                payment.getAmount().subtract(totalRefunded);
 
         if (amount.compareTo(remainingAmount) > 0) {
             throw new IllegalArgumentException(
-                    "Refund amount exceeds remaining amount"
-            );
+                    "Refund amount exceeds the remaining refundable amount");
         }
 
-        // Get Stripe PaymentIntent
         PaymentIntent paymentIntent =
                 PaymentIntent.retrieve(
-                        payment.getStripePaymentIntentId()
-                );
+                        payment.getStripePaymentIntentId());
 
-        String chargeId =
-                paymentIntent.getLatestCharge();
-
-        if (chargeId == null) {
+        if (paymentIntent.getLatestCharge() == null) {
             throw new IllegalStateException(
-                    "No charge found for PaymentIntent"
-            );
+                    "No charge found for PaymentIntent "
+                            + paymentIntent.getId());
         }
 
-        // Create Stripe Refund
         RefundCreateParams params =
                 RefundCreateParams.builder()
-                        .setCharge(chargeId)
-                        .setAmount(
-                                amount
-                                        .movePointRight(2)
-                                        .longValue()
-                        )
+                        .setCharge(paymentIntent.getLatestCharge())
+                        .setAmount(StripeAmountConverter.toSmallestUnits(amount))
                         .build();
 
         Refund refund = Refund.create(params);
+
+        log.info("Stripe refund {} created for payment {}",
+                refund.getId(), payment.getId());
 
         return refund.getId();
     }
